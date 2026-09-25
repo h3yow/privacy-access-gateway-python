@@ -1,0 +1,51 @@
+{
+  "version": "2026-09-26-v1",
+  "sensitive_rules": [
+    {
+      "field": "phone",
+      "pattern": "^1\\d{10}$",
+      "normalizer": "digits",
+      "scope": "phone",
+      "mode": "masked"
+    },
+    {
+      "field": "email",
+      "pattern": "^[0-9a-z]+[0-9a-z.]*$",
+      "normalizer": "alnum",
+      "scope": "email",
+      "mode": "masked"
+    },
+    {
+      "field": "id_card",
+      "pattern": "^[0-9]{17}[0-9x]$",
+      "normalizer": "digits",
+      "scope": "id_card",
+      "mode": "masked"
+    }
+  ],
+  "roles": [
+    {
+      "role": "admin",
+      "fields": [
+        {"field": "phone", "mode": "masked"},
+        {"field": "email", "mode": "redacted"},
+        {"field": "id_card", "mode": "hidden"},
+        {"field": "city", "mode": "masked"}
+      ]
+    },
+    {
+      "role": "analyst",
+      "fields": [
+        {"field": "phone", "mode": "redacted"},
+        {"field": "city", "mode": "masked"}
+      ],
+      "row_conditions": [
+        {"attribute": "city", "operator": "in", "value": ["BJ", "SH"]}
+      ]
+    }
+  ],
+  "retention": [
+    {"tenant_id": "tenant-a", "retention_days": 30, "action": "delete"},
+    {"tenant_id": "tenant-b", "retention_days": 90, "action": "anonymize"}
+  ]
+}
