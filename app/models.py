@@ -87,6 +87,11 @@ class StoredRecord:
     created_at: str
     # active | anonymized (purged records are physically deleted)
     status: str = "active"
+    # HMAC over the full business content (canonical masked payload + attributes).
+    # Drives true idempotency: identical whole-content writes are duplicates,
+    # while records merely sharing one sensitive value stay independent.
+    # Cleared on anonymization so linkage cannot be rebuilt afterwards.
+    content_fingerprint: str = ""
 
 
 # ---- audit ----

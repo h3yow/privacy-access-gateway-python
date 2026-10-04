@@ -6,7 +6,9 @@
 2. **基于角色与属性（RBAC + ABAC）的字段级 / 行级访问控制**——越权访问被拒绝且拒绝原因可区分。
 3. **策略版本化与历史结论可复现**——策略变更后，仍可按当时生效的策略版本重放历史判定。
 4. **并发隔离、保留期管理与逐条容错**——跨租户不串读、不重复脱敏；到期按确定语义清除或不可逆脱敏；重复执行幂等；单条畸形记录不阻塞整批处理。
-5. **可核验但不泄密的审计日志**——日志与持久层只保存指纹/令牌与判定依据，从不保存原始敏感值。
+5. **批量接入（一批几十到几百条）**——逐条独立判定、独立落库，单条坏数据不带崩整批也不被悄悄放过；支持按 `batch_id` 安全重发（断点续跑、结果逐字一致）。
+6. **兜底敏感识别**——租户规则未声明、但内容明显是敏感信息（自由文本里的邮箱/手机号/身份证形态，或一看就是证件/卡号的字段名）同样拦截，拒绝原因与既有的缺字段/类型错/取值不匹配可区分。
+7. **可核验但不泄密的审计日志**——日志与持久层只保存指纹/令牌与判定依据，从不保存原始敏感值。
 
 ---
 
@@ -60,27 +62,49 @@ uv run pytest                 # 运行全部测试
 
 ### 2.3 拒绝（不静默放行）
 
-写入时所有已声明敏感字段必须存在且可通过校验，否则整次写入以 422 拒绝：
+写入时所有已声明敏感字段必须存在且可通过校验，否则该条写入以 422 拒绝（单条接口抛错；批量接口体现在该条的 `reason` 上）：
 
 | reason | 触发条件 |
 | --- | --- |
 | `sensitive_field_missing` | 负载缺少策略声明的敏感字段 |
 | `value_pattern_mismatch` | 原值不匹配规则正则 |
 | `non_string_value` | 敏感值不是字符串 |
-| `invalid_payload` | 负载为空或不是对象 |
+| `invalid_payload` / `invalid_attributes` | 负载/属性为空或不是对象 |
+| `undeclared_sensitive_content` | **兜底**：未声明字段的自由文本里出现明显敏感内容（见 2.6） |
+| `undeclared_sensitive_field_name` | **兜底**：未声明字段名一看即敏感（见 2.6） |
 
-### 2.4 “原始值永不落盘、永不入日志”
+### 2.5 去重与“整条内容幂等”
 
-- `records` 表只保存脱敏后的 payload 与 `{fingerprint, token}` 索引；**原始值不在任何列中**。
-- 审计表 `input_summary`/`evidence` 只保存字段名、长度、指纹、令牌、命中的规则描述。
-- 测试 `test_raw_value_never_persisted` 直接扫描 SQLite 文件字节与审计 JSON，断言原值与完整证件号均不存在。
+幂等单位是**整条业务内容**，不是单个敏感字段。系统对「规范化后的脱敏 payload + 业务 attributes」计算 `content_fingerprint`（HMAC，字段顺序无关），在租户级临界区内按它查重：
 
-### 2.5 去重与“重复脱敏”
+- 整条内容完全一致（包括非敏感字段与 attributes）⇒ 返回 `duplicate`（幂等，不新增记录、不重复脱敏；审计原因 `duplicate_write_idempotent`）。
+- **仅仅共用了同一个敏感值、但业务内容不同**（例如同一个手机号对应两笔不同订单）⇒ 两条记录各自正常成立，不会被当成重复拒掉；确定性脱敏对该共用值仍给出一致的令牌/掩码。
+- 旧版“指纹相同但 payload 不同即 `fingerprint_collision_conflict` 拒绝”的行为已移除：共享敏感值是合法的业务关联，不应误拒。
 
-写入在租户级临界区内按“所有敏感字段指纹完全一致”查重：
+### 2.6 兜底敏感识别（规则没声明也要拦）
 
-- 已有记录且脱敏后 payload 相同 ⇒ 返回 `duplicate`（幂等，不新增记录、不重复脱敏；审计原因 `duplicate_write_idempotent`）。
-- 指纹相同但非敏感内容不同 ⇒ 以 403 `fingerprint_collision_conflict` 拒绝，避免把同一敏感身份错误地关联到不同业务内容。
+已声明规则永远优先；对策略**未声明**的顶层字段，网关再做两道保守的启发式扫描（实现见 `app/fallback.py`）：
+
+1. **值形态扫描**（`undeclared_sensitive_content`）——在任意字符串字段（包括自由文本）里识别：
+   - 邮箱：`local@domain.tld`；
+   - 中国大陆手机号：带数字边界的 `1[3-9] + 9 位`（避免把 12 位订单号等更长数字串截断误报）；
+   - 居民身份证形态：带边界的 17 位数字 + 数字/`X`。
+2. **字段名扫描**（`undeclared_sensitive_field_name`）——对下划线/大小写归一化后，命中明确的证件/联系方式/银行卡命名（如 `id_card`、`id_card_no`、`passport_no`、`email_addr`、`mobile`、`bank_card_no`、`card_number` 等），即使取值本身不像也 fail-closed 拒绝，要求租户先显式声明规则。
+
+边界与取舍（有意为之）：
+
+- **只扫描 payload 的顶层标量字段**；不递归嵌套容器，也不扫描业务 `attributes`（attributes 按非敏感业务属性处理，供 ABAC 使用）。
+- 普通业务键 `id`、`order_id` 这类**不**在命名词表里，避免误伤。
+- 命中后不做自动脱敏放行，而是**拒绝并要求租户声明规则**——这样新发现的敏感类型由租户决定脱敏策略，不会以网关猜测的形态悄悄落库。
+- 命中证据只含字段名、检测器名（`email`/`mobile_cn`/`id_card_cn`/字段名类别）和命中值的 **HMAC 指纹**；命中的原文片段只在内存中短暂使用，不返回、不入日志、不入库。
+- 这两个 reason 与 `sensitive_field_missing` / `non_string_value` / `value_pattern_mismatch` 明确区分，上游可据此决定“补声明后重推”还是“修数据后重推”。
+
+### 2.7 “原始值永不落盘、永不入日志”
+
+- `records` 表只保存脱敏后的 payload、`{fingerprint, token}` 索引与 `content_fingerprint`；**原始值不在任何列中**。
+- 审计表 `input_summary`/`evidence` 只保存字段名、长度、指纹、令牌、命中的规则/检测器描述。
+- 批量幂等表保存的是请求内容的**单向请求指纹**（用于识别“同 batch_id 但内容变了”的重推），不含原值，且该指纹不写入日志。
+- 测试 `test_raw_value_never_persisted`、`test_fallback_raw_match_never_persisted_or_logged`、`test_batch_contains_no_raw_values_in_persisted_results` 直接扫描 SQLite 文件字节、审计 JSON 与完整测试日志，断言原值不存在。
 
 ---
 
@@ -168,6 +192,74 @@ uv run pytest                 # 运行全部测试
 
 ---
 
+## 6A. 批量接入（Batch Ingestion）
+
+`POST /tenants/{t}/records/batch` 一次提交多条记录，body：
+
+```json
+{
+  "batch_id": "upstream-20261005-0001",
+  "items": [
+    {"payload": {"phone": "13800001111", "note": "订单 A"},
+     "attributes": {"order": "A"}, "client_item_id": "up-1001"},
+    {"payload": {"phone": "bad-value", "note": "订单 B"},
+     "client_item_id": "up-1002"}
+  ]
+}
+```
+
+- `items[*]`：每条含 `payload`（必填、非空对象）、可选 `attributes`、可选 `client_item_id`（上游自己的逐条对账键，结果中原样回显）。
+- `batch_id`：**可选**幂等键。上游“超时后重推同一批”时应带上同一个 `batch_id`。
+
+### 6A.1 逐条独立结果
+
+每条记录独立判定、独立落库；一条数据有问题不会回滚或带崩整批，也不会被悄悄放过。HTTP 整体返回 200，逐条结果在 `items` 中按下标对齐：
+
+```json
+{
+  "batch_id": "upstream-20261005-0001",
+  "policy_version": 1,
+  "summary": {"total": 2, "created": 1, "duplicate": 0, "rejected": 1},
+  "items": [
+    {"index": 0, "client_item_id": "up-1001", "status": "created",
+     "reason": "classified_and_stored", "record_id": "...", "policy_version": 1},
+    {"index": 1, "client_item_id": "up-1002", "status": "rejected",
+     "reason": "value_pattern_mismatch",
+     "message": "value of 'phone' does not match required pattern",
+     "policy_version": 1}
+  ]
+}
+```
+
+- 条状态：`created`（成功落盘）/ `duplicate`（命中已有同内容记录，幂等）/ `rejected`（被拒绝，带可区分 `reason` 与可读 `message`）。
+- 成功条给 `record_id`；拒绝条给 `reason`。原因码覆盖：`sensitive_field_missing`、`non_string_value`、`value_pattern_mismatch`、`undeclared_sensitive_content`、`undeclared_sensitive_field_name`，彼此可区分，方便上游按条对账和只重推失败项。
+- **批量响应不含脱敏 payload 之外的任何原值**（敏感字段本就只有令牌/掩码）；被兜底拦截的原值片段也不出现在响应里。
+
+### 6A.2 信封级错误（整批 422）
+
+只有“批量信封本身不可解析/不一致”才在条目处理之前整体拒绝：
+
+| reason | 触发条件 |
+| --- | --- |
+| `empty_batch` | `items` 为空或不是列表 |
+| `malformed_batch_item` | 某个元素不是对象或缺 `payload` 键 |
+| `invalid_payload` / `invalid_attributes` / `invalid_client_item_id` | 元素级结构类型错误 |
+| `batch_too_large` | 超过单批上限 1000 条 |
+| `invalid_batch_id` | `batch_id` 给了但为空串 |
+| `batch_id_shape_mismatch` | 同一 `batch_id` 重推时条目数与首次不同 |
+| `batch_id_content_mismatch` | 同 `batch_id` 重推时某条的请求内容（或 `client_item_id`）与首次不一致 |
+| `batch_in_progress`（409） | 同一 `batch_id` 正由另一个请求在处理中 |
+
+### 6A.3 安全重发、并发与崩溃恢复
+
+- **结果逐字一致**：同一 `batch_id` 重推，返回的每条 `status`/`record_id`/`reason` 与首次完全相同（便于上游对账），既不新增记录，也不重复产生逐条审计/写入副作用；每次重推仅额外记录一条 `batch_idempotent_replay` 的批次级审计（只含计数）。
+- **断点续跑**：若处理进程在批次中途崩溃（批次停留 `processing`、部分条目已存结果），重推会复用已完成条目的存档结果、只补跑未完成条目，最终仍然恰好成功一次。
+- **并发**：同一 `batch_id` 的并发请求，一个处理、其余得到明确的 `409 batch_in_progress`（稍后重试即可取到最终结果）；不同 `batch_id` 的批量、并发单条写入、读取、保留期扫描可以同时进行，互不串租户、不丢记录、不出现读不到的中间态。
+- **不带 `batch_id`**：每次都正常处理，不做批次级幂等登记；同内容重复提交会通过内容级去重表现为各条 `duplicate`。
+- **体量**：单批上限 1000 条；常规规模（一次几百条）在本地 SQLite/WAL 下毫秒~百毫秒级完成，无超时级退化（测试 400 条 < 5s，实际约 0.1s/500 条）。
+
+---
+
 ## 7. HTTP 接口
 
 | 方法与路径 | 说明 |
@@ -175,7 +267,8 @@ uv run pytest                 # 运行全部测试
 | `POST /tenants/{t}/provision` | 开通租户（策略 v1 + 保留期配置） |
 | `POST /tenants/{t}/policy` | 追加策略新版本 |
 | `GET  /tenants/{t}/policy` | 列出全部历史策略版本 |
-| `POST /tenants/{t}/records` | 写入（自动脱敏 / 查重），body：`{payload, attributes}` |
+| `POST /tenants/{t}/records` | 单条写入（自动脱敏 / 内容级查重），body：`{payload, attributes}` |
+| `POST /tenants/{t}/records/batch` | **批量写入**，body：`{batch_id?, items:[{payload, attributes?, client_item_id?}]}` |
 | `GET  /tenants/{t}/records/{id}?role=` | 简单角色读取 |
 | `POST /tenants/{t}/records/{id}/read` | 带主体属性读取，body：`{role, attrs}` |
 | `POST /tenants/{t}/records/query` | 列表查询（行/字段过滤后返回） |
@@ -194,19 +287,25 @@ uv run pytest                 # 运行全部测试
 ## 8. 验证方法
 
 ```bash
-uv run pytest -q
+uv run pytest -q          # 安静模式，仅汇总
+uv run pytest -s          # 输出每个用例的中文场景行与安全决策日志
 ```
 
-测试矩阵（47 个用例）：
+测试矩阵（97 个用例）：
 
 | 文件 | 覆盖点 |
 | --- | --- |
 | `tests/test_masking.py` | 原值变体（大小写/格式/空白）、稳定性、跨租户令牌隔离、partial 边界、写后读一致性、原始值不落盘不入日志、各类写入拒绝原因 |
+| `tests/test_fallback_detection.py` | **新增**：自由文本中的邮箱/手机号/身份证形态兜底拦截、长数字串不误报、证件/银行卡类字段名识别、字段名下划线变体、普通 `id` 不误伤、已声明字段不重复兜底、与既有 4 类拒绝原因区分、干净文本放行、兜底命中原值不落盘不入审计 |
+| `tests/test_batch_ingestion.py` | **新增**：一批混合成功/重复/拒绝逐条可区分、5 类拒绝原因互不相同、逐条独立提交、信封级 6 种结构错误、批量上限、`batch_id` 重发逐字一致且不多存、形状/内容不一致的重发拒绝、共享敏感值不同内容各自成立、仅整条内容一致才算重复、批量与单条共享去重、批量链路原值不落盘不入日志、无 `batch_id` 行为 |
+| `tests/test_batch_idempotency_concurrency.py` | **新增**：重发 record_id/状态一致、重发不重复副作用（仅多重放标记）、处理中途崩溃后断点续跑且恰好一次、8 线程并发同批只存一份、批量+单条+读取并发不丢记录/无中间态、两租户同批不串且指纹不交、批量与保留期扫描并发、400 条性能 |
 | `tests/test_policies.py` | 5 类畸形字段规则、5 类畸形角色、未知角色、ABAC 区域/属主过滤、字段拒绝与行拒绝原因区分、默认角色、策略变更后历史结论重放 |
 | `tests/test_concurrency.py` | 跨租户令牌/指纹隔离、跨租户读取失败、8 线程同值去重为 1 条、双租户 40 条并发写入不串扰 |
 | `tests/test_retention.py` | 边界（恰好到期 vs +1 秒）、purge 幂等、anonymize 不可逆且幂等、保留期配置校验、单条失败不阻塞整批且可补偿 |
 | `tests/test_audit_replay.py` | 旧版本字段拒绝重放、ABAC 主体属性重放、写入指纹一致性重放、被拒写入重放、匿名化销毁确认 |
-| `tests/test_api.py` | HTTP 全生命周期、原因码区分、审计响应不含原值、策略变更 + 重放、保留期幂等 |
+| `tests/test_api.py` | HTTP 全生命周期、原因码区分、审计响应不含原值、策略变更 + 重放、保留期幂等、**批量端点逐条结果/重发一致/空信封拒绝/单条兜底** |
+
+`tests/conftest.py` 会为每个用例打印一行 `[PASS]/[FAIL] 场景: …`（取测试文档首行，新增用例均为中文场景说明），可以直接看出覆盖了哪些场景与每个场景的结果；这些场景行只包含用例名/描述，不含任何敏感值。
 
 测试日志示例（注意：只有指纹与判定依据，没有原值）：
 
@@ -229,8 +328,9 @@ app/
   config.py       主密钥/数据库配置
   errors.py       四类领域异常与稳定 reason 码
   models.py       规则/策略版本/记录/审计等领域类型
-  masking.py      HMAC 密钥派生、指纹、确定性令牌、partial 掩码
+  masking.py      HMAC 密钥派生、指纹、确定性令牌、partial 掩码、内容/请求指纹
   classifier.py   字段规则校验与负载脱敏（拒绝原因在此产生）
+  fallback.py     兜底识别：未声明字段的值形态扫描与敏感字段名扫描
   access.py       字段可见性与 ABAC 行过滤判定
   retention.py    到期边界判定（UTC、闭开区间）
   audit.py        审计条目构造

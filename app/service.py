@@ -1,6 +1,8 @@
 """Application service: orchestrates classification, access control, storage and audit."""
 from __future__ import annotations
 
+import json
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -11,12 +13,15 @@ from app.classifier import classify_payload, validate_rule
 from app.config import Settings
 from app.errors import (
     AccessDeniedError,
+    BatchConflictError,
+    BatchError,
     ClassificationError,
     PolicyError,
     RetentionError,
 )
+from app.fallback import FallbackHit, scan_undeclared_sensitive
 from app.logging_utils import log_decision
-from app.masking import tenant_key
+from app.masking import content_fingerprint, request_fingerprint, tenant_key
 from app.models import (
     ClassifiedValue,
     FieldRule,
@@ -48,6 +53,10 @@ class GatewayService:
     def __init__(self, settings: Settings, storage: Storage) -> None:
         self.settings = settings
         self.storage = storage
+        # Batch ids whose processing call is alive in this process. Used to
+        # distinguish a concurrent live attempt from a crash restart.
+        self._live_batches: set[tuple[str, str]] = set()
+        self._live_lock = threading.Lock()
 
     def _key(self, tenant_id: str) -> bytes:
         return tenant_key(self.settings.master_key, tenant_id)
@@ -272,39 +281,480 @@ class GatewayService:
     # ------------------------------------------------------------------
     def write_record(self, tenant_id: str, payload: dict, attributes: dict) -> dict:
         config = self._require_tenant(tenant_id)
-        policy = config.policy
         if not isinstance(payload, dict) or not payload:
             raise ClassificationError(
                 "payload must be a non-empty object", reason="invalid_payload"
             )
-
-        summary = self._write_summary(payload, policy)
-        try:
-            masked_payload, classified = classify_payload(
-                payload, policy.rules, self._key(tenant_id)
+        if not isinstance(attributes, dict):
+            raise ClassificationError(
+                "attributes must be an object", reason="invalid_attributes"
             )
-        except ClassificationError as exc:
+        outcome = self._write_one_item(config, payload, attributes, audit=True)
+        if outcome["status"] == "rejected":
+            raise ClassificationError(
+                outcome.get("message", outcome["reason"]), reason=outcome["reason"]
+            )
+        return {
+            "record_id": outcome["record_id"],
+            "status": outcome["status"],
+            "policy_version": outcome["policy_version"],
+            "masked_payload": outcome["masked_payload"],
+        }
+
+    # ------------------------------------------------------------------
+    # data plane: batch write
+    # ------------------------------------------------------------------
+    MAX_BATCH_ITEMS = 1000
+
+    def write_records_batch(
+        self, tenant_id: str, batch: list[dict], *, batch_id: str | None
+    ) -> dict[str, Any]:
+        config = self._require_tenant(tenant_id)
+        if not isinstance(batch, list) or not batch:
+            raise BatchError(
+                "batch must be a non-empty list of items", reason="empty_batch"
+            )
+        if len(batch) > self.MAX_BATCH_ITEMS:
+            raise BatchError(
+                f"batch exceeds the maximum of {self.MAX_BATCH_ITEMS} items",
+                reason="batch_too_large",
+            )
+        if batch_id is not None and (
+            not isinstance(batch_id, str) or not batch_id.strip()
+        ):
+            raise BatchError(
+                "batch_id must be a non-empty string", reason="invalid_batch_id"
+            )
+
+        # Envelope validation is whole-call: every element must carry a usable
+        # payload so each result can always be aligned to its upstream index.
+        # Per-item content problems are NOT raised here — they are classified
+        # independently and reported per item below.
+        req_fps: list[str] = []
+        client_ids: list[str | None] = []
+        for idx, item in enumerate(batch):
+            if not isinstance(item, dict) or "payload" not in item:
+                raise BatchError(
+                    f"item at index {idx} must be an object with a payload",
+                    reason="malformed_batch_item",
+                )
+            payload = item["payload"]
+            if not isinstance(payload, dict) or not payload:
+                raise BatchError(
+                    f"item at index {idx} has an invalid payload",
+                    reason="invalid_payload",
+                )
+            attributes = item.get("attributes", {})
+            if not isinstance(attributes, dict):
+                raise BatchError(
+                    f"item at index {idx} attributes must be an object",
+                    reason="invalid_attributes",
+                )
+            cid = item.get("client_item_id")
+            if cid is not None and not isinstance(cid, str):
+                raise BatchError(
+                    f"item at index {idx} client_item_id must be a string",
+                    reason="invalid_client_item_id",
+                )
+            req_fps.append(
+                request_fingerprint(self._key(tenant_id), payload, attributes)
+            )
+            client_ids.append(cid)
+
+        if batch_id is None:
+            return self._process_batch_items(config, batch, batch_id=None)
+        return self._run_keyed_batch(config, batch_id, batch, req_fps, client_ids)
+
+    def _run_keyed_batch(
+        self,
+        config: TenantConfig,
+        batch_id: str,
+        batch: list[dict],
+        req_fps: list[str],
+        client_ids: list[str | None],
+    ) -> dict[str, Any]:
+        tenant_id = config.tenant_id
+        with self.storage.lock():
+            run = self.storage.get_batch_run(tenant_id, batch_id)
+            if run is None:
+                self._reserve_batch_run(
+                    config, batch_id, len(batch), req_fps, client_ids
+                )
+            else:
+                return self._handle_existing_batch(
+                    config, batch_id, run, batch, req_fps, client_ids
+                )
+
+        with self._live_lock:
+            self._live_batches.add((tenant_id, batch_id))
+        try:
+            result = self._process_batch_items(config, batch, batch_id=batch_id)
+        finally:
+            with self._live_lock:
+                self._live_batches.discard((tenant_id, batch_id))
+
+        with self.storage.lock():
+            run = self.storage.get_batch_run(tenant_id, batch_id)
+            if run is not None and run["status"] == "completed" and run["result_json"]:
+                # A concurrent resumable attempt finished first.
+                return json.loads(run["result_json"])
+            self.storage.complete_batch_run(
+                tenant_id,
+                batch_id,
+                json.dumps(result, ensure_ascii=False),
+                utcnow_iso(),
+            )
+        self._audit_batch_summary(tenant_id, batch_id, result, replay=False)
+        return result
+
+    def _reserve_batch_run(
+        self,
+        config: TenantConfig,
+        batch_id: str,
+        item_count: int,
+        req_fps: list[str],
+        client_ids: list[str | None],
+    ) -> None:
+        tenant_id = config.tenant_id
+        created = self.storage.insert_batch_run(
+            tenant_id,
+            batch_id,
+            item_count=item_count,
+            policy_version=config.policy.version,
+            created_at=utcnow_iso(),
+        )
+        if not created:
+            # Lost a race between the get and the insert.
+            run = self.storage.get_batch_run(tenant_id, batch_id)
+            assert run is not None
+            raise BatchConflictError(
+                "batch is already registered; retry to obtain its result",
+                reason="batch_in_progress",
+            )
+        for idx, (rfp, cid) in enumerate(zip(req_fps, client_ids)):
+            self.storage.insert_batch_item(tenant_id, batch_id, idx, rfp, cid)
+
+    def _handle_existing_batch(
+        self,
+        config: TenantConfig,
+        batch_id: str,
+        run,
+        batch: list[dict],
+        req_fps: list[str],
+        client_ids: list[str | None],
+    ) -> dict[str, Any]:
+        tenant_id = config.tenant_id
+        rows = self.storage.list_batch_items(tenant_id, batch_id)
+        if len(rows) != len(req_fps):
+            raise BatchError(
+                "batch_id was already used with a different item count",
+                reason="batch_id_shape_mismatch",
+            )
+        for row, rfp, cid in zip(rows, req_fps, client_ids):
+            if row["request_fingerprint"] != rfp:
+                raise BatchError(
+                    f"item at index {row['item_index']} differs from the first"
+                    " submission carrying this batch_id",
+                    reason="batch_id_content_mismatch",
+                )
+            if (row["client_item_id"] is not None or cid is not None) and (
+                row["client_item_id"] != cid
+            ):
+                raise BatchError(
+                    f"item at index {row['item_index']} client_item_id differs"
+                    " from the first submission carrying this batch_id",
+                    reason="batch_id_content_mismatch",
+                )
+
+        if run["status"] == "completed" and run["result_json"]:
+            stored = json.loads(run["result_json"])
+            self._audit_batch_summary(tenant_id, batch_id, stored, replay=True)
+            return stored
+
+        # status == 'processing': concurrent live attempt or a crash restart.
+        with self._live_lock:
+            live = (tenant_id, batch_id) in self._live_batches
+        if live:
+            raise BatchConflictError(
+                "batch is still being processed by another request; retry later",
+                reason="batch_in_progress",
+            )
+        return self._resume_processing(config, batch_id, batch, rows)
+
+    def _resume_processing(
+        self,
+        config: TenantConfig,
+        batch_id: str,
+        batch: list[dict],
+        rows: list,
+    ) -> dict[str, Any]:
+        tenant_id = config.tenant_id
+        with self._live_lock:
+            if (tenant_id, batch_id) in self._live_batches:
+                raise BatchConflictError(
+                    "batch is still being processed by another request; retry later",
+                    reason="batch_in_progress",
+                )
+            self._live_batches.add((tenant_id, batch_id))
+        try:
+            items_out: list[dict[str, Any]] = []
+            for row in rows:
+                stored = row["result_json"]
+                if stored is not None:
+                    # Already handled before a crash/restart: reuse the stored
+                    # outcome exactly and do NOT re-execute (no duplicate audit
+                    # side effects, no duplicate writes).
+                    items_out.append(json.loads(stored))
+                else:
+                    item = batch[row["item_index"]]
+                    items_out.append(
+                        self._process_one_for_batch(
+                            config, row["item_index"], item, batch_id
+                        )
+                    )
+            result = self._assemble_batch_result(tenant_id, batch_id, items_out)
+        finally:
+            with self._live_lock:
+                self._live_batches.discard((tenant_id, batch_id))
+        with self.storage.lock():
+            run = self.storage.get_batch_run(tenant_id, batch_id)
+            if run is not None and run["status"] == "completed" and run["result_json"]:
+                return json.loads(run["result_json"])
+            self.storage.complete_batch_run(
+                tenant_id,
+                batch_id,
+                json.dumps(result, ensure_ascii=False),
+                utcnow_iso(),
+            )
+        self._audit_batch_summary(tenant_id, batch_id, result, replay=False)
+        return result
+
+    def _process_batch_items(
+        self, config: TenantConfig, batch: list[dict], *, batch_id: str | None
+    ) -> dict[str, Any]:
+        items_out = [
+            self._process_one_for_batch(config, idx, item, batch_id)
+            for idx, item in enumerate(batch)
+        ]
+        return self._assemble_batch_result(config.tenant_id, batch_id, items_out)
+
+    def _assemble_batch_result(
+        self, tenant_id: str, batch_id: str | None, items_out: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        counts = {"created": 0, "duplicate": 0, "rejected": 0}
+        for it in items_out:
+            counts[it["status"]] += 1
+        policy_version = items_out[0]["policy_version"]
+        return {
+            "tenant_id": tenant_id,
+            "batch_id": batch_id,
+            "policy_version": policy_version,
+            "items": items_out,
+            "summary": {"total": len(items_out), **counts},
+        }
+
+    def _process_one_for_batch(
+        self,
+        config: TenantConfig,
+        idx: int,
+        item: dict,
+        batch_id: str | None,
+    ) -> dict[str, Any]:
+        """Process one batch item: independent classify/dedup/store decision.
+
+        Item writes emit the same per-item audit trail as single writes (when
+        they actually execute), and the outcome is additionally persisted for
+        idempotent batch replay. ``masked_payload`` is stripped from the
+        persisted per-item result to avoid duplicating stored content.
+        """
+        payload = item["payload"]
+        attributes = item.get("attributes", {})
+        client_item_id = item.get("client_item_id")
+
+        outcome = self._write_one_item(config, payload, attributes, audit=True)
+        result: dict[str, Any] = {
+            "index": idx,
+            "client_item_id": client_item_id,
+            "status": outcome["status"],
+            "policy_version": outcome["policy_version"],
+        }
+        if outcome["status"] == "rejected":
+            result["reason"] = outcome["reason"]
+            result["message"] = outcome.get("message", outcome["reason"])
+        else:
+            result["record_id"] = outcome["record_id"]
+            result["reason"] = (
+                "duplicate_write_idempotent"
+                if outcome["status"] == "duplicate"
+                else "classified_and_stored"
+            )
+
+        if batch_id is not None:
+            self.storage.save_batch_item_result(
+                config.tenant_id,
+                batch_id,
+                idx,
+                result_json=json.dumps(result, ensure_ascii=False),
+                record_id=result.get("record_id"),
+            )
+        return result
+
+    def _audit_batch_summary(
+        self,
+        tenant_id: str,
+        batch_id: str,
+        result: dict[str, Any],
+        *,
+        replay: bool,
+    ) -> None:
+        summary = result["summary"]
+        self._audit(
+            tenant_id=tenant_id,
+            event_type="batch_write",
+            decision="allow",
+            reason="batch_idempotent_replay" if replay else "batch_accepted",
+            policy_version=result["policy_version"],
+            subject=None,
+            record_id=None,
+            input_summary={
+                "batch_id": batch_id,
+                "total": summary["total"],
+                "created": summary["created"],
+                "duplicate": summary["duplicate"],
+                "rejected": summary["rejected"],
+            },
+            evidence={"replay": replay},
+        )
+
+    @staticmethod
+    def _fallback_summary(hits: list[FallbackHit]) -> dict[str, Any]:
+        """Safe evidence for fallback detection: names, detectors, fingerprints."""
+        return {
+            "hits": [
+                {
+                    "field": h.field_name,
+                    "kind": h.kind,
+                    "detector": h.detector,
+                    "value_fingerprint": h.value_fingerprint,
+                    "rule": h.description,
+                }
+                for h in hits
+            ],
+        }
+
+    def _reject_item(
+        self,
+        config: TenantConfig,
+        payload: dict,
+        reason: str,
+        message: str,
+        evidence: dict[str, Any],
+        *,
+        summary: dict[str, Any] | None = None,
+        audit: bool,
+    ) -> dict[str, Any]:
+        policy = config.policy
+        if audit:
             self._audit(
-                tenant_id=tenant_id,
+                tenant_id=config.tenant_id,
                 event_type="write",
                 decision="reject",
-                reason=exc.reason,
+                reason=reason,
                 policy_version=policy.version,
                 subject=None,
                 record_id=None,
-                input_summary=summary,
-                evidence={"stage": "classification", "message": str(exc)},
+                input_summary=summary
+                if summary is not None
+                else self._write_summary(payload, policy),
+                evidence=evidence,
             )
-            raise
+        return {
+            "status": "rejected",
+            "reason": reason,
+            "message": message,
+            "policy_version": policy.version,
+        }
 
-        fingerprints = {f: cv.value_fingerprint for f, cv in classified.items()}
+    def _write_one_item(
+        self,
+        config: TenantConfig,
+        payload: dict,
+        attributes: dict,
+        *,
+        audit: bool,
+    ) -> dict[str, Any]:
+        """Classify, fallback-scan, dedup and store one item.
+
+        Never raises for item-level rejections: the outcome dict carries
+        ``status`` (created | duplicate | rejected) plus a machine-readable
+        ``reason`` so callers can process batches item by item.
+        """
+        tenant_id = config.tenant_id
+        policy = config.policy
+        key = self._key(tenant_id)
+        summary = self._write_summary(payload, policy)
+
+        # 1) Declared sensitive rules are authoritative and fail closed.
+        try:
+            masked_payload, classified = classify_payload(
+                payload, policy.rules, key
+            )
+        except ClassificationError as exc:
+            return self._reject_item(
+                config,
+                payload,
+                exc.reason,
+                str(exc),
+                {"stage": "classification", "message": str(exc)},
+                summary=summary,
+                audit=audit,
+            )
+
+        # 2) Fallback detection for fields the tenant did NOT declare.
+        hits = scan_undeclared_sensitive(payload, set(policy.rules), key)
+        if hits:
+            value_hits = [h for h in hits if h.kind == "value"]
+            name_hits = [h for h in hits if h.kind == "field_name"]
+            if value_hits:
+                reason = "undeclared_sensitive_content"
+                message = (
+                    "obvious sensitive content found in an undeclared field;"
+                    " declare a rule for the field before writing"
+                )
+                stage_hits = value_hits
+            else:
+                reason = "undeclared_sensitive_field_name"
+                message = (
+                    "an undeclared field name denotes sensitive data;"
+                    " declare a rule for the field before writing"
+                )
+                stage_hits = name_hits
+            evidence: dict[str, Any] = {
+                "stage": "fallback_detection",
+                **self._fallback_summary(stage_hits),
+            }
+            if value_hits and name_hits:
+                evidence["additional_field_name_hits"] = self._fallback_summary(
+                    name_hits
+                )["hits"]
+            return self._reject_item(
+                config,
+                payload,
+                reason,
+                message,
+                evidence,
+                summary=summary,
+                audit=audit,
+            )
+
+        content_fp = content_fingerprint(key, masked_payload, attributes)
         record_id = uuid.uuid4().hex
 
-        # ---- critical section: dedup + insert under the tenant storage lock ----
+        # 3) Whole-content dedup + insert in the tenant storage critical section.
         with self.storage.lock():
-            existing = self.storage.find_record(tenant_id, fingerprints)
+            existing = self.storage.find_active_by_content(tenant_id, content_fp)
             if existing is not None:
-                if existing.masked_payload == masked_payload:
+                if audit:
                     self._audit(
                         tenant_id=tenant_id,
                         event_type="write",
@@ -313,29 +763,17 @@ class GatewayService:
                         policy_version=policy.version,
                         subject=None,
                         record_id=existing.record_id,
-                        input_summary=self._classified_summary(classified),
-                        evidence={"dedup": "identical_masked_payload"},
+                        input_summary=self._classified_summary(
+                            classified, content_fp=content_fp
+                        ),
+                        evidence={"dedup": "identical_whole_content"},
                     )
-                    return {
-                        "record_id": existing.record_id,
-                        "status": "duplicate",
-                        "policy_version": policy.version,
-                    }
-                self._audit(
-                    tenant_id=tenant_id,
-                    event_type="write",
-                    decision="deny",
-                    reason="fingerprint_collision_conflict",
-                    policy_version=policy.version,
-                    subject=None,
-                    record_id=existing.record_id,
-                    input_summary=self._classified_summary(classified),
-                    evidence={"dedup": "same_fingerprint_different_payload"},
-                )
-                raise AccessDeniedError(
-                    "a different record with the same sensitive values already exists",
-                    reason="fingerprint_collision_conflict",
-                )
+                return {
+                    "record_id": existing.record_id,
+                    "status": "duplicate",
+                    "policy_version": policy.version,
+                    "masked_payload": existing.masked_payload,
+                }
 
             record = StoredRecord(
                 record_id=record_id,
@@ -348,24 +786,26 @@ class GatewayService:
                 attributes=dict(attributes),
                 created_at=utcnow_iso(),
                 status="active",
+                content_fingerprint=content_fp,
             )
             self.storage.insert_record(record)
 
-        self._audit(
-            tenant_id=tenant_id,
-            event_type="write",
-            decision="allow",
-            reason="classified_and_stored",
-            policy_version=policy.version,
-            subject=None,
-            record_id=record_id,
-            input_summary=self._classified_summary(classified),
-            evidence={
-                "rules": {
-                    f: cv.rule_description for f, cv in classified.items()
+        if audit:
+            self._audit(
+                tenant_id=tenant_id,
+                event_type="write",
+                decision="allow",
+                reason="classified_and_stored",
+                policy_version=policy.version,
+                subject=None,
+                record_id=record_id,
+                input_summary=self._classified_summary(
+                    classified, content_fp=content_fp
+                ),
+                evidence={
+                    "rules": {f: cv.rule_description for f, cv in classified.items()},
                 },
-            },
-        )
+            )
         return {
             "record_id": record_id,
             "status": "created",
@@ -386,14 +826,19 @@ class GatewayService:
         }
 
     @staticmethod
-    def _classified_summary(classified: dict[str, ClassifiedValue]) -> dict[str, Any]:
+    def _classified_summary(
+        classified: dict[str, ClassifiedValue], *, content_fp: str | None = None
+    ) -> dict[str, Any]:
         """Post-classification summary: fingerprints/tokens only, never raw values."""
-        return {
+        summary = {
             "fields": sorted(classified.keys()),
             "fingerprints": {
                 f: cv.value_fingerprint for f, cv in classified.items()
             },
         }
+        if content_fp is not None:
+            summary["content_fingerprint"] = content_fp
+        return summary
 
     # ------------------------------------------------------------------
     # data plane: read / list
@@ -654,14 +1099,9 @@ class GatewayService:
             key: (_ANONYMIZED if key in record.sensitive_index else value)
             for key, value in record.masked_payload.items()
         }
-        with self.storage.lock():
-            self.storage.update_record_payload(
-                record.tenant_id,
-                record.record_id,
-                anon_payload,
-                {},  # destroy fingerprints/tokens: linkage becomes impossible
-                status="anonymized",
-            )
+        self.storage.anonymize_record(
+            record.tenant_id, record.record_id, anon_payload
+        )
 
     # ------------------------------------------------------------------
     # audit / replay

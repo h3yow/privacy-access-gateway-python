@@ -36,3 +36,15 @@ class RetentionError(GatewayError):
     """Raised when a retention request is invalid."""
 
     status_code = 422
+
+
+class BatchError(GatewayError):
+    """Raised when a batch envelope itself is malformed / inconsistent."""
+
+    status_code = 422
+
+
+class BatchConflictError(GatewayError):
+    """Raised when the same batch_id is still being processed concurrently."""
+
+    status_code = 409

@@ -33,14 +33,45 @@ CREATE TABLE IF NOT EXISTS records (
     sensitive_index TEXT NOT NULL,
     attributes      TEXT NOT NULL,
     created_at      TEXT NOT NULL,
+    content_fingerprint TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (tenant_id, record_id)
 );
+-- Whole-content idempotency: one active record per business-content digest.
+-- Empty digests (pre-feature rows / direct storage fixtures) are excluded.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_records_content
+    ON records(tenant_id, content_fingerprint)
+    WHERE status = 'active' AND content_fingerprint <> '';
+-- Same sensitive values may legitimately occur in several records; the
+-- record_id is part of the key so sharing a fingerprint is allowed.
 CREATE TABLE IF NOT EXISTS dedup_index (
     tenant_id        TEXT NOT NULL,
     field_name       TEXT NOT NULL,
     value_fingerprint TEXT NOT NULL,
     record_id        TEXT NOT NULL,
-    PRIMARY KEY (tenant_id, field_name, value_fingerprint)
+    PRIMARY KEY (tenant_id, record_id, field_name)
+);
+CREATE INDEX IF NOT EXISTS ix_dedup_lookup
+    ON dedup_index(tenant_id, field_name, value_fingerprint);
+CREATE TABLE IF NOT EXISTS batch_runs (
+    tenant_id    TEXT NOT NULL,
+    batch_id     TEXT NOT NULL,
+    status       TEXT NOT NULL,              -- processing | completed
+    item_count   INTEGER NOT NULL,
+    policy_version INTEGER NOT NULL,
+    result_json  TEXT,
+    created_at   TEXT NOT NULL,
+    completed_at TEXT,
+    PRIMARY KEY (tenant_id, batch_id)
+);
+CREATE TABLE IF NOT EXISTS batch_items (
+    tenant_id        TEXT NOT NULL,
+    batch_id         TEXT NOT NULL,
+    item_index       INTEGER NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    client_item_id   TEXT,
+    result_json      TEXT,                   -- NULL while still processing
+    record_id        TEXT,
+    PRIMARY KEY (tenant_id, batch_id, item_index)
 );
 CREATE TABLE IF NOT EXISTS audit_logs (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,9 +102,30 @@ class Storage:
                 self.database_path, check_same_thread=False
             )
             self._conn.row_factory = sqlite3.Row
-            self._conn.execute("PRAGMA journal_mode=WAL");
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            # WAL + NORMAL is safe across application crashes (fsync at WAL
+            # checkpoints) and keeps batched commits well inside budget.
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._conn.execute("PRAGMA busy_timeout=5000")
             self._conn.executescript(_SCHEMA)
+            self._migrate_locked()
             self._conn.commit()
+
+    def _migrate_locked(self) -> None:
+        """Additive migrations for databases created by older versions."""
+        db = self._conn
+        cols = {r["name"] for r in db.execute("PRAGMA table_info(records)")}
+        if "content_fingerprint" not in cols:
+            db.execute(
+                "ALTER TABLE records ADD COLUMN content_fingerprint TEXT NOT NULL DEFAULT ''"
+            )
+        # Recreate the partial unique index so it matches the current predicate.
+        db.execute("DROP INDEX IF EXISTS ux_records_content")
+        db.execute(
+            "CREATE UNIQUE INDEX ux_records_content ON records"
+            "(tenant_id, content_fingerprint)"
+            " WHERE status = 'active' AND content_fingerprint <> ''"
+        )
 
     def close(self) -> None:
         with self._lock:
@@ -249,6 +301,7 @@ class Storage:
     # ---- records ----
     @staticmethod
     def _record_from_row(row: sqlite3.Row) -> StoredRecord:
+        keys = row.keys()
         return StoredRecord(
             record_id=row["record_id"],
             tenant_id=row["tenant_id"],
@@ -257,32 +310,24 @@ class Storage:
             attributes=json.loads(row["attributes"]),
             created_at=row["created_at"],
             status=row["status"],
+            content_fingerprint=(
+                row["content_fingerprint"] if "content_fingerprint" in keys else ""
+            ),
         )
 
-    def find_record(
-        self, tenant_id: str, fingerprints: dict[str, str]
+    def find_active_by_content(
+        self, tenant_id: str, content_fp: str
     ) -> StoredRecord | None:
-        """Find the active record matching ALL given field fingerprints."""
-        if not fingerprints:
+        """Find the active record whose whole business content matches."""
+        if not content_fp:
             return None
         with self._lock:
-            db = self._db()
-            for field_name, fp in fingerprints.items():
-                row = db.execute(
-                    "SELECT r.* FROM records r JOIN dedup_index d"
-                    " ON d.tenant_id=r.tenant_id AND d.record_id=r.record_id"
-                    " WHERE r.tenant_id=? AND r.status='active'"
-                    " AND d.field_name=? AND d.value_fingerprint=?",
-                    (tenant_id, field_name, fp),
-                ).fetchone()
-                if row is None:
-                    return None
-            candidate = self._record_from_row(row)
-            index = candidate.sensitive_index
-            if all(index.get(f, {}).get("fingerprint") == fp
-                   for f, fp in fingerprints.items()):
-                return candidate
-            return None
+            row = self._db().execute(
+                "SELECT * FROM records WHERE tenant_id=? AND status='active'"
+                " AND content_fingerprint=?",
+                (tenant_id, content_fp),
+            ).fetchone()
+            return self._record_from_row(row) if row is not None else None
 
     def get_record(self, tenant_id: str, record_id: str) -> StoredRecord | None:
         with self._lock:
@@ -305,7 +350,8 @@ class Storage:
             db = self._db()
             db.execute(
                 "INSERT INTO records(record_id, tenant_id, status, masked_payload,"
-                " sensitive_index, attributes, created_at) VALUES (?,?,?,?,?,?,?)",
+                " sensitive_index, attributes, created_at, content_fingerprint)"
+                " VALUES (?,?,?,?,?,?,?,?)",
                 (
                     record.record_id,
                     record.tenant_id,
@@ -314,6 +360,7 @@ class Storage:
                     json.dumps(record.sensitive_index, ensure_ascii=False),
                     json.dumps(record.attributes, ensure_ascii=False),
                     record.created_at,
+                    record.content_fingerprint,
                 ),
             )
             for field_name, idx in record.sensitive_index.items():
@@ -321,41 +368,6 @@ class Storage:
                     "INSERT INTO dedup_index(tenant_id, field_name, value_fingerprint,"
                     " record_id) VALUES (?,?,?,?)",
                     (record.tenant_id, field_name, idx["fingerprint"], record.record_id),
-                )
-            db.commit()
-
-    def update_record_payload(
-        self,
-        tenant_id: str,
-        record_id: str,
-        masked_payload: dict,
-        sensitive_index: dict,
-        status: str | None = None,
-    ) -> None:
-        with self._lock:
-            db = self._db()
-            if status is None:
-                db.execute(
-                    "UPDATE records SET masked_payload=?, sensitive_index=?"
-                    " WHERE tenant_id=? AND record_id=?",
-                    (
-                        json.dumps(masked_payload, ensure_ascii=False),
-                        json.dumps(sensitive_index, ensure_ascii=False),
-                        tenant_id,
-                        record_id,
-                    ),
-                )
-            else:
-                db.execute(
-                    "UPDATE records SET masked_payload=?, sensitive_index=?, status=?"
-                    " WHERE tenant_id=? AND record_id=?",
-                    (
-                        json.dumps(masked_payload, ensure_ascii=False),
-                        json.dumps(sensitive_index, ensure_ascii=False),
-                        status,
-                        tenant_id,
-                        record_id,
-                    ),
                 )
             db.commit()
 
@@ -369,6 +381,27 @@ class Storage:
             db.execute(
                 "DELETE FROM records WHERE tenant_id=? AND record_id=?",
                 (tenant_id, record_id),
+            )
+            db.commit()
+
+    def anonymize_record(self, tenant_id: str, record_id: str, masked_payload: dict) -> None:
+        """Mark a record anonymized and destroy every linkage fingerprint."""
+        with self._lock:
+            db = self._db()
+            db.execute(
+                "DELETE FROM dedup_index WHERE tenant_id=? AND record_id=?",
+                (tenant_id, record_id),
+            )
+            db.execute(
+                "UPDATE records SET masked_payload=?, sensitive_index=?,"
+                " content_fingerprint='', status='anonymized'"
+                " WHERE tenant_id=? AND record_id=?",
+                (
+                    json.dumps(masked_payload, ensure_ascii=False),
+                    json.dumps({}, ensure_ascii=False),
+                    tenant_id,
+                    record_id,
+                ),
             )
             db.commit()
 
@@ -437,6 +470,105 @@ class Storage:
             evidence=json.loads(row["evidence"]),
             occurred_at=row["occurred_at"],
         )
+
+    # ---- batch idempotency ----
+    def get_batch_run(self, tenant_id: str, batch_id: str) -> sqlite3.Row | None:
+        with self._lock:
+            return self._db().execute(
+                "SELECT * FROM batch_runs WHERE tenant_id=? AND batch_id=?",
+                (tenant_id, batch_id),
+            ).fetchone()
+
+    def insert_batch_run(
+        self,
+        tenant_id: str,
+        batch_id: str,
+        *,
+        item_count: int,
+        policy_version: int,
+        created_at: str,
+    ) -> bool:
+        """Reserve a batch id. Returns False if it already exists (any state)."""
+        with self._lock:
+            try:
+                self._db().execute(
+                    "INSERT INTO batch_runs(tenant_id, batch_id, status, item_count,"
+                    " policy_version, result_json, created_at, completed_at)"
+                    " VALUES (?,?, 'processing', ?, ?, NULL, ?, NULL)",
+                    (tenant_id, batch_id, item_count, policy_version, created_at),
+                )
+                self._db().commit()
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+    def insert_batch_item(
+        self,
+        tenant_id: str,
+        batch_id: str,
+        item_index: int,
+        request_fingerprint: str,
+        client_item_id: str | None,
+    ) -> None:
+        with self._lock:
+            self._db().execute(
+                "INSERT INTO batch_items(tenant_id, batch_id, item_index,"
+                " request_fingerprint, client_item_id, result_json, record_id)"
+                " VALUES (?,?,?,?,?,NULL,NULL)",
+                (
+                    tenant_id,
+                    batch_id,
+                    item_index,
+                    request_fingerprint,
+                    client_item_id,
+                ),
+            )
+            self._db().commit()
+
+    def list_batch_items(self, tenant_id: str, batch_id: str) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._db().execute(
+                "SELECT * FROM batch_items WHERE tenant_id=? AND batch_id=?"
+                " ORDER BY item_index",
+                (tenant_id, batch_id),
+            ).fetchall()
+
+    def get_batch_item(
+        self, tenant_id: str, batch_id: str, item_index: int
+    ) -> sqlite3.Row | None:
+        with self._lock:
+            return self._db().execute(
+                "SELECT * FROM batch_items WHERE tenant_id=? AND batch_id=? AND item_index=?",
+                (tenant_id, batch_id, item_index),
+            ).fetchone()
+
+    def save_batch_item_result(
+        self,
+        tenant_id: str,
+        batch_id: str,
+        item_index: int,
+        *,
+        result_json: str,
+        record_id: str | None,
+    ) -> None:
+        with self._lock:
+            self._db().execute(
+                "UPDATE batch_items SET result_json=?, record_id=?"
+                " WHERE tenant_id=? AND batch_id=? AND item_index=?",
+                (result_json, record_id, tenant_id, batch_id, item_index),
+            )
+            self._db().commit()
+
+    def complete_batch_run(
+        self, tenant_id: str, batch_id: str, result_json: str, completed_at: str
+    ) -> None:
+        with self._lock:
+            self._db().execute(
+                "UPDATE batch_runs SET status='completed', result_json=?,"
+                " completed_at=? WHERE tenant_id=? AND batch_id=?",
+                (result_json, completed_at, tenant_id, batch_id),
+            )
+            self._db().commit()
 
     # ---- locking helpers ----
     def lock(self) -> threading.RLock:

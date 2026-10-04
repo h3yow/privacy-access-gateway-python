@@ -42,6 +42,19 @@ class WriteIn(BaseModel):
     attributes: dict[str, Any] = Field(default_factory=dict)
 
 
+class BatchItemIn(BaseModel):
+    payload: dict[str, Any]
+    attributes: dict[str, Any] = Field(default_factory=dict)
+    # Optional upstream-side per-item key, echoed verbatim in the result.
+    client_item_id: str | None = None
+
+
+class BatchWriteIn(BaseModel):
+    items: list[BatchItemIn]
+    # Idempotency key: resending the same batch_id must not double-store.
+    batch_id: str | None = None
+
+
 class SubjectIn(BaseModel):
     role: str
     attrs: dict[str, Any] = Field(default_factory=dict)

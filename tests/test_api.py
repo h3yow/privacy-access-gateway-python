@@ -206,3 +206,71 @@ def test_retention_http_idempotent(client):
     assert r2.json()["anonymized"] == [w["record_id"]]
     r3 = client.post("/tenants/acme/retention/run?now=2100-01-01T00:00:00Z")
     assert r3.json()["anonymized"] == []
+
+
+def test_batch_endpoint_reports_per_item_outcomes(client):
+    """场景：HTTP 批量接口逐条返回成功/拒绝原因且响应不含原值。"""
+    client.post("/tenants/acme/provision", json={"tenant_id": "acme", **PROVISION})
+    r = client.post("/tenants/acme/records/batch", json={
+        "batch_id": "http-batch-1",
+        "items": [
+            {"payload": {"email": "batch1@example.com", "phone": "13800001001"},
+             "client_item_id": "one"},
+            {"payload": {"email": "x", "phone": "13800001002"}},
+            {"payload": {"email": "batch3@example.com", "phone": "13800001003",
+                         "memo": "free text with eve@example.com inside"}},
+        ],
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["summary"] == {
+        "total": 3, "created": 1, "duplicate": 0, "rejected": 2
+    }
+    items = body["items"]
+    assert items[0]["status"] == "created"
+    assert items[0]["client_item_id"] == "one"
+    assert items[1]["reason"] == "value_pattern_mismatch"
+    assert items[2]["reason"] == "undeclared_sensitive_content"
+    # Raw values never appear in the HTTP response.
+    assert "batch1@example.com" not in r.text
+    assert "13800001001" not in r.text
+    assert "eve@example.com" not in r.text
+
+
+def test_batch_endpoint_retry_is_idempotent_and_consistent(client):
+    """场景：HTTP 批量重发结果一致且不多存。"""
+    client.post("/tenants/acme/provision", json={"tenant_id": "acme", **PROVISION})
+    payload = {
+        "batch_id": "http-retry",
+        "items": [
+            {"payload": {"email": f"user{i}@example.com", "phone": f"1380000{i:04d}"},
+             "client_item_id": f"k{i}"}
+            for i in range(5)
+        ],
+    }
+    r1 = client.post("/tenants/acme/records/batch", json=payload)
+    r2 = client.post("/tenants/acme/records/batch", json=payload)
+    assert r1.json()["items"] == r2.json()["items"]
+    assert r1.json()["summary"] == {"total": 5, "created": 5,
+                                    "duplicate": 0, "rejected": 0}
+
+
+def test_batch_endpoint_rejects_empty_envelope(client):
+    """场景：HTTP 空批量信封被 422 拒绝。"""
+    client.post("/tenants/acme/provision", json={"tenant_id": "acme", **PROVISION})
+    r = client.post("/tenants/acme/records/batch", json={"items": []})
+    assert r.status_code == 422
+    assert r.json()["reason"] == "empty_batch"
+
+
+def test_single_write_also_applies_fallback_detection(client):
+    """场景：单条 HTTP 写入同样启用兜底识别且错误响应不含原值。"""
+    client.post("/tenants/acme/provision", json={"tenant_id": "acme", **PROVISION})
+    r = client.post("/tenants/acme/records", json={
+        "payload": {"email": "ok1@example.com", "phone": "13800001234",
+                    "note": "call me at 13912345678"},
+        "attributes": {},
+    })
+    assert r.status_code == 422
+    assert r.json()["reason"] == "undeclared_sensitive_content"
+    assert "13912345678" not in r.text

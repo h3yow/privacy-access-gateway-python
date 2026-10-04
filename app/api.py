@@ -7,12 +7,15 @@ from fastapi.responses import JSONResponse
 from app.deps import get_service
 from app.errors import (
     AccessDeniedError,
+    BatchConflictError,
+    BatchError,
     ClassificationError,
     GatewayError,
     PolicyError,
     RetentionError,
 )
 from app.schemas import (
+    BatchWriteIn,
     PolicyChangeIn,
     ProvisionIn,
     SubjectIn,
@@ -88,6 +91,16 @@ def register_routes() -> APIRouter:
     def write_record(tenant_id: str, body: WriteIn, svc: GatewayService = Depends(get_service)):
         return svc.write_record(tenant_id, body.payload, body.attributes)
 
+    @router.post("/records/batch")
+    def write_records_batch(
+        tenant_id: str, body: BatchWriteIn, svc: GatewayService = Depends(get_service)
+    ):
+        return svc.write_records_batch(
+            tenant_id,
+            [item.model_dump() for item in body.items],
+            batch_id=body.batch_id,
+        )
+
     @router.get("/records/{record_id}")
     def read_record(
         tenant_id: str,
@@ -148,5 +161,12 @@ def register_error_handlers(app) -> None:
                      "message": str(exc)},
         )
 
-    for etype in (ClassificationError, AccessDeniedError, PolicyError, RetentionError):
+    for etype in (
+        ClassificationError,
+        AccessDeniedError,
+        PolicyError,
+        RetentionError,
+        BatchError,
+        BatchConflictError,
+    ):
         app.add_exception_handler(etype, lambda request, exc: _handler(exc))
