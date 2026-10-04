@@ -42,6 +42,22 @@ class WriteIn(BaseModel):
     attributes: dict[str, Any] = Field(default_factory=dict)
 
 
+class BatchItemIn(BaseModel):
+    # Kept permissive on purpose: each item is judged independently by the
+    # service so one bad item never fails the whole batch. item_id is an
+    # upstream-supplied correlation key echoed back in the per-item result.
+    payload: dict[str, Any] | None = None
+    attributes: dict[str, Any] = Field(default_factory=dict)
+    item_id: str | None = None
+
+
+class BatchWriteIn(BaseModel):
+    # Deliberately untyped element-wise: every item is judged independently by
+    # the service, so a malformed item becomes a per-item rejection rather than
+    # failing the whole batch at request validation.
+    records: list[Any] = Field(default_factory=list)
+
+
 class SubjectIn(BaseModel):
     role: str
     attrs: dict[str, Any] = Field(default_factory=dict)

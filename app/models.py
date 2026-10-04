@@ -87,6 +87,10 @@ class StoredRecord:
     created_at: str
     # active | anonymized (purged records are physically deleted)
     status: str = "active"
+    # sha256 over the canonical masked payload: identity is the *whole*
+    # business content, so records that merely share a sensitive value but
+    # differ elsewhere are independent and never collide.
+    content_hash: str = ""
 
 
 # ---- audit ----

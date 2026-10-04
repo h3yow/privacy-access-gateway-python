@@ -8,10 +8,21 @@ class GatewayError(Exception):
     status_code: int = 400
     reason: str = "gateway_error"
 
-    def __init__(self, message: str = "", *, reason: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        reason: str | None = None,
+        summary: dict | None = None,
+        evidence: dict | None = None,
+    ) -> None:
         super().__init__(message or self.reason)
         if reason is not None:
             self.reason = reason
+        # Audit-safe attachments (field names / fingerprints only, never raw
+        # sensitive values); populated by the classification layer.
+        self.summary = summary
+        self.evidence = evidence
 
 
 class ClassificationError(GatewayError):

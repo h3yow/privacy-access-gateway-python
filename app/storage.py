@@ -1,6 +1,7 @@
 """SQLite-backed persistence. Stores only masked data; never raw values."""
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import threading
@@ -33,14 +34,21 @@ CREATE TABLE IF NOT EXISTS records (
     sensitive_index TEXT NOT NULL,
     attributes      TEXT NOT NULL,
     created_at      TEXT NOT NULL,
+    content_hash    TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (tenant_id, record_id)
+);
+CREATE TABLE IF NOT EXISTS records_hash_ledger (
+    tenant_id    TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    record_id    TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, content_hash)
 );
 CREATE TABLE IF NOT EXISTS dedup_index (
     tenant_id        TEXT NOT NULL,
     field_name       TEXT NOT NULL,
     value_fingerprint TEXT NOT NULL,
     record_id        TEXT NOT NULL,
-    PRIMARY KEY (tenant_id, field_name, value_fingerprint)
+    PRIMARY KEY (tenant_id, field_name, value_fingerprint, record_id)
 );
 CREATE TABLE IF NOT EXISTS audit_logs (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,6 +66,18 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 """
 
 
+def content_hash_for(masked_payload: dict) -> str:
+    """Identity hash of a record's business content.
+
+    Computed over the *masked* payload (which itself contains no raw values),
+    so two identical business contents — however they were spelt upstream —
+    share a hash iff they are genuinely the same record. Shared sensitive
+    values combined with different other fields hash differently.
+    """
+    canonical = json.dumps(masked_payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 class Storage:
     def __init__(self, database_path: str) -> None:
         self.database_path = database_path
@@ -73,7 +93,64 @@ class Storage:
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA journal_mode=WAL");
             self._conn.executescript(_SCHEMA)
+            self._migrate()
             self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Upgrade databases created by earlier versions in place."""
+        db = self._db()
+        cols = {r["name"] for r in db.execute("PRAGMA table_info(records)")}
+        if "content_hash" not in cols:
+            db.execute("ALTER TABLE records ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''")
+            rows = db.execute(
+                "SELECT tenant_id, record_id, masked_payload FROM records"
+            ).fetchall()
+            for row in rows:
+                chash = content_hash_for(json.loads(row["masked_payload"]))
+                db.execute(
+                    "UPDATE records SET content_hash=? WHERE tenant_id=? AND record_id=?",
+                    (chash, row["tenant_id"], row["record_id"]),
+                )
+        # Backfill the identity ledger for pre-existing active records.
+        existing = {
+            (r["tenant_id"], r["content_hash"])
+            for r in db.execute(
+                "SELECT tenant_id, content_hash FROM records_hash_ledger"
+            ).fetchall()
+        }
+        for row in db.execute(
+            "SELECT tenant_id, record_id, content_hash FROM records"
+            " WHERE status='active' AND content_hash<>''"
+        ).fetchall():
+            if (row["tenant_id"], row["content_hash"]) not in existing:
+                db.execute(
+                    "INSERT OR IGNORE INTO records_hash_ledger(tenant_id,"
+                    " content_hash, record_id) VALUES (?,?,?)",
+                    (row["tenant_id"], row["content_hash"], row["record_id"]),
+                )
+        # Earlier dedup_index primary keys disallowed sharing a fingerprint;
+        # rebuild it with the record-id-inclusive key when an old layout exists.
+        # PRAGMA table_info's "pk" column is 0 for non-key columns, so column
+        # count alone cannot distinguish the layouts (both have 4 columns).
+        pragma = db.execute("PRAGMA table_info(dedup_index)").fetchall()
+        pk_columns = {
+            r["name"]: r["pk"] for r in pragma
+        }
+        if pk_columns.get("record_id", 0) == 0:  # legacy: record_id not in PK
+            db.execute("ALTER TABLE dedup_index RENAME TO dedup_index_old")
+            db.execute(
+                "CREATE TABLE dedup_index ("
+                " tenant_id TEXT NOT NULL, field_name TEXT NOT NULL,"
+                " value_fingerprint TEXT NOT NULL, record_id TEXT NOT NULL,"
+                " PRIMARY KEY (tenant_id, field_name, value_fingerprint, record_id))"
+            )
+            db.execute(
+                "INSERT OR IGNORE INTO dedup_index(tenant_id, field_name,"
+                " value_fingerprint, record_id)"
+                " SELECT tenant_id, field_name, value_fingerprint, record_id"
+                " FROM dedup_index_old"
+            )
+            db.execute("DROP TABLE dedup_index_old")
 
     def close(self) -> None:
         with self._lock:
@@ -249,6 +326,7 @@ class Storage:
     # ---- records ----
     @staticmethod
     def _record_from_row(row: sqlite3.Row) -> StoredRecord:
+        keys = row.keys()
         return StoredRecord(
             record_id=row["record_id"],
             tenant_id=row["tenant_id"],
@@ -257,32 +335,27 @@ class Storage:
             attributes=json.loads(row["attributes"]),
             created_at=row["created_at"],
             status=row["status"],
+            content_hash=row["content_hash"] if "content_hash" in keys else "",
         )
 
-    def find_record(
-        self, tenant_id: str, fingerprints: dict[str, str]
+    def find_record_by_content(
+        self, tenant_id: str, content_hash: str
     ) -> StoredRecord | None:
-        """Find the active record matching ALL given field fingerprints."""
-        if not fingerprints:
+        """Find the active record whose whole masked payload hashes to ``content_hash``.
+
+        Duplicate identity is the complete business content: merely sharing one
+        sensitive value with a different record does not match.
+        """
+        if not content_hash:
             return None
         with self._lock:
-            db = self._db()
-            for field_name, fp in fingerprints.items():
-                row = db.execute(
-                    "SELECT r.* FROM records r JOIN dedup_index d"
-                    " ON d.tenant_id=r.tenant_id AND d.record_id=r.record_id"
-                    " WHERE r.tenant_id=? AND r.status='active'"
-                    " AND d.field_name=? AND d.value_fingerprint=?",
-                    (tenant_id, field_name, fp),
-                ).fetchone()
-                if row is None:
-                    return None
-            candidate = self._record_from_row(row)
-            index = candidate.sensitive_index
-            if all(index.get(f, {}).get("fingerprint") == fp
-                   for f, fp in fingerprints.items()):
-                return candidate
-            return None
+            row = self._db().execute(
+                "SELECT r.* FROM records r JOIN records_hash_ledger h"
+                " ON h.tenant_id=r.tenant_id AND h.record_id=r.record_id"
+                " WHERE r.tenant_id=? AND r.status='active' AND h.content_hash=?",
+                (tenant_id, content_hash),
+            ).fetchone()
+            return self._record_from_row(row) if row is not None else None
 
     def get_record(self, tenant_id: str, record_id: str) -> StoredRecord | None:
         with self._lock:
@@ -303,9 +376,11 @@ class Storage:
     def insert_record(self, record: StoredRecord) -> None:
         with self._lock:
             db = self._db()
+            content_hash = record.content_hash or content_hash_for(record.masked_payload)
             db.execute(
                 "INSERT INTO records(record_id, tenant_id, status, masked_payload,"
-                " sensitive_index, attributes, created_at) VALUES (?,?,?,?,?,?,?)",
+                " sensitive_index, attributes, created_at, content_hash)"
+                " VALUES (?,?,?,?,?,?,?,?)",
                 (
                     record.record_id,
                     record.tenant_id,
@@ -314,7 +389,13 @@ class Storage:
                     json.dumps(record.sensitive_index, ensure_ascii=False),
                     json.dumps(record.attributes, ensure_ascii=False),
                     record.created_at,
+                    content_hash,
                 ),
+            )
+            db.execute(
+                "INSERT INTO records_hash_ledger(tenant_id, content_hash, record_id)"
+                " VALUES (?,?,?)",
+                (record.tenant_id, content_hash, record.record_id),
             )
             for field_name, idx in record.sensitive_index.items():
                 db.execute(
@@ -334,6 +415,18 @@ class Storage:
     ) -> None:
         with self._lock:
             db = self._db()
+            # Anonymization destroys sensitive identity linkage: release the
+            # content hash and fingerprint rows so the identity can never be
+            # reused or correlated afterwards.
+            if status == "anonymized":
+                db.execute(
+                    "DELETE FROM records_hash_ledger WHERE tenant_id=? AND record_id=?",
+                    (tenant_id, record_id),
+                )
+                db.execute(
+                    "DELETE FROM dedup_index WHERE tenant_id=? AND record_id=?",
+                    (tenant_id, record_id),
+                )
             if status is None:
                 db.execute(
                     "UPDATE records SET masked_payload=?, sensitive_index=?"
@@ -362,6 +455,10 @@ class Storage:
     def delete_record(self, tenant_id: str, record_id: str) -> None:
         with self._lock:
             db = self._db()
+            db.execute(
+                "DELETE FROM records_hash_ledger WHERE tenant_id=? AND record_id=?",
+                (tenant_id, record_id),
+            )
             db.execute(
                 "DELETE FROM dedup_index WHERE tenant_id=? AND record_id=?",
                 (tenant_id, record_id),

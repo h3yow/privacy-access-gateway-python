@@ -15,6 +15,10 @@ from app.errors import (
     PolicyError,
     RetentionError,
 )
+from app.fallback import (
+    detect_fallback_sensitive,
+    hits_evidence,
+)
 from app.logging_utils import log_decision
 from app.masking import tenant_key
 from app.models import (
@@ -26,13 +30,16 @@ from app.models import (
     TenantConfig,
 )
 from app.retention import is_expired, utcnow_iso
-from app.storage import Storage
+from app.storage import Storage, content_hash_for
 
 _VALID_VISIBILITY = {"visible", "masked", "denied"}
 _VALID_RETENTION = {"purge", "anonymize"}
 
 # Sentinel replacement used when retention action = anonymize.
 _ANONYMIZED = "***RETENTION-ANONYMIZED***"
+
+# Batch envelope limits; upstream pushes tens-to-hundreds of records.
+MAX_BATCH_SIZE = 1000
 
 
 def _parse_ts(ts: str) -> datetime:
@@ -270,19 +277,60 @@ class GatewayService:
     # ------------------------------------------------------------------
     # data plane: write
     # ------------------------------------------------------------------
-    def write_record(self, tenant_id: str, payload: dict, attributes: dict) -> dict:
-        config = self._require_tenant(tenant_id)
-        policy = config.policy
+    def _classify_one(
+        self, tenant_id: str, payload: Any, policy: PolicyVersion
+    ) -> tuple[dict, dict[str, ClassifiedValue]]:
+        """Run declared-rule classification plus fallback detection.
+
+        Raises ClassificationError with a distinct, stable reason for every
+        failure mode; the audit summary/evidence passed back via the raised
+        error never contains raw values.
+        """
         if not isinstance(payload, dict) or not payload:
             raise ClassificationError(
                 "payload must be a non-empty object", reason="invalid_payload"
             )
-
         summary = self._write_summary(payload, policy)
+
+        # Safety net first: content/fields the tenant never declared as
+        # sensitive are rejected with their own distinct reasons, even when a
+        # declared field is also missing — undeclared sensitive data must never
+        # be hidden behind a generic "missing field" rejection.
+        hits = detect_fallback_sensitive(
+            payload,
+            declared_fields=set(policy.rules.keys()),
+            key=self._key(tenant_id),
+        )
+        if hits:
+            primary = hits[0]
+            raise ClassificationError(
+                "payload contains sensitive data not declared by policy",
+                reason=primary.reason,
+                summary=summary,
+                evidence=hits_evidence(hits),
+            )
+
         try:
             masked_payload, classified = classify_payload(
                 payload, policy.rules, self._key(tenant_id)
             )
+        except ClassificationError as exc:
+            exc.summary = summary  # type: ignore[attr-defined]
+            exc.evidence = {"stage": "classification", "message": str(exc)}  # type: ignore[attr-defined]
+            raise
+
+        return masked_payload, classified
+
+    def write_record(self, tenant_id: str, payload: dict, attributes: dict) -> dict:
+        """Write one record; rejected writes raise (single-record API)."""
+        config = self._require_tenant(tenant_id)
+        policy = config.policy
+        summary = self._write_summary(payload, policy) if (
+            isinstance(payload, dict) and payload
+        ) else {"payload_fields": [], "declared_sensitive_fields": sorted(
+            policy.rules.keys()), "field_lengths": {}}
+        try:
+            masked_payload, classified = self._classify_one(tenant_id, payload, policy)
         except ClassificationError as exc:
             self._audit(
                 tenant_id=tenant_id,
@@ -292,50 +340,37 @@ class GatewayService:
                 policy_version=policy.version,
                 subject=None,
                 record_id=None,
-                input_summary=summary,
-                evidence={"stage": "classification", "message": str(exc)},
+                input_summary=getattr(exc, "summary", summary),
+                evidence=getattr(exc, "evidence", {
+                    "stage": "classification", "message": str(exc)
+                }),
             )
             raise
 
         fingerprints = {f: cv.value_fingerprint for f, cv in classified.items()}
         record_id = uuid.uuid4().hex
+        chash = content_hash_for(masked_payload)
 
-        # ---- critical section: dedup + insert under the tenant storage lock ----
+        # ---- critical section: content dedup + insert under storage lock ----
         with self.storage.lock():
-            existing = self.storage.find_record(tenant_id, fingerprints)
+            existing = self.storage.find_record_by_content(tenant_id, chash)
             if existing is not None:
-                if existing.masked_payload == masked_payload:
-                    self._audit(
-                        tenant_id=tenant_id,
-                        event_type="write",
-                        decision="allow",
-                        reason="duplicate_write_idempotent",
-                        policy_version=policy.version,
-                        subject=None,
-                        record_id=existing.record_id,
-                        input_summary=self._classified_summary(classified),
-                        evidence={"dedup": "identical_masked_payload"},
-                    )
-                    return {
-                        "record_id": existing.record_id,
-                        "status": "duplicate",
-                        "policy_version": policy.version,
-                    }
                 self._audit(
                     tenant_id=tenant_id,
                     event_type="write",
-                    decision="deny",
-                    reason="fingerprint_collision_conflict",
+                    decision="allow",
+                    reason="duplicate_write_idempotent",
                     policy_version=policy.version,
                     subject=None,
                     record_id=existing.record_id,
                     input_summary=self._classified_summary(classified),
-                    evidence={"dedup": "same_fingerprint_different_payload"},
+                    evidence={"dedup": "identical_masked_payload"},
                 )
-                raise AccessDeniedError(
-                    "a different record with the same sensitive values already exists",
-                    reason="fingerprint_collision_conflict",
-                )
+                return {
+                    "record_id": existing.record_id,
+                    "status": "duplicate",
+                    "policy_version": policy.version,
+                }
 
             record = StoredRecord(
                 record_id=record_id,
@@ -348,6 +383,7 @@ class GatewayService:
                 attributes=dict(attributes),
                 created_at=utcnow_iso(),
                 status="active",
+                content_hash=chash,
             )
             self.storage.insert_record(record)
 
@@ -371,6 +407,133 @@ class GatewayService:
             "status": "created",
             "policy_version": policy.version,
             "masked_payload": masked_payload,
+        }
+
+    # ------------------------------------------------------------------
+    # data plane: batch write
+    # ------------------------------------------------------------------
+    def write_records_batch(self, tenant_id: str, items: Any) -> dict:
+        """Ingest a batch of records, judging and persisting each one on its own.
+
+        One malformed / non-compliant item never fails the batch or is silently
+        skipped: its per-item result carries a distinct ``reason``. The HTTP
+        status of the batch call itself is always 200 once the envelope is
+        valid; see each item's ``status`` for per-record outcomes.
+
+        Safe resend semantics rely on content identity (whole masked payload):
+        resending a batch returns the same record ids/statuses/reasons and
+        stores nothing twice.
+        """
+        config = self._require_tenant(tenant_id)
+        policy = config.policy
+        if not isinstance(items, list) or not items:
+            raise ClassificationError(
+                "records must be a non-empty list", reason="invalid_batch"
+            )
+        if len(items) > MAX_BATCH_SIZE:
+            raise ClassificationError(
+                f"batch size {len(items)} exceeds limit {MAX_BATCH_SIZE}",
+                reason="batch_too_large",
+            )
+
+        results: list[dict[str, Any]] = []
+        counts = {"created": 0, "duplicate": 0, "rejected": 0}
+        for index, item in enumerate(items):
+            if not isinstance(item, dict) or "payload" not in item:
+                entry = {
+                    "index": index,
+                    "item_id": item.get("item_id") if isinstance(item, dict) else None,
+                    "status": "rejected",
+                    "reason": "invalid_payload",
+                    "message": "each item must be an object with a payload",
+                }
+                results.append(entry)
+                counts["rejected"] += 1
+                self._audit(
+                    tenant_id=tenant_id,
+                    event_type="batch_write",
+                    decision="reject",
+                    reason="invalid_payload",
+                    policy_version=policy.version,
+                    subject=None,
+                    record_id=None,
+                    input_summary={"index": index},
+                    evidence={"stage": "batch_envelope"},
+                )
+                continue
+
+            item_id = item.get("item_id")
+            attributes = item.get("attributes", {})
+            if not isinstance(attributes, dict):
+                attributes = {}
+            payload = item["payload"]
+            entry: dict[str, Any] = {"index": index, "item_id": item_id}
+            try:
+                outcome = self.write_record(tenant_id, payload, attributes)
+            except ClassificationError as exc:
+                entry.update(
+                    {
+                        "status": "rejected",
+                        "reason": exc.reason,
+                        "message": str(exc),
+                    }
+                )
+                counts["rejected"] += 1
+            except Exception as exc:  # noqa: BLE001 - isolate per-item failure
+                # Never let an unexpected per-item failure take the batch down,
+                # and never echo payload content: expose the exception class only.
+                entry.update(
+                    {
+                        "status": "rejected",
+                        "reason": "internal_item_error",
+                        "message": type(exc).__name__,
+                    }
+                )
+                counts["rejected"] += 1
+                self._audit(
+                    tenant_id=tenant_id,
+                    event_type="batch_write",
+                    decision="reject",
+                    reason="internal_item_error",
+                    policy_version=policy.version,
+                    subject=None,
+                    record_id=None,
+                    input_summary={"index": index},
+                    evidence={"error_type": type(exc).__name__},
+                )
+            else:
+                entry.update(
+                    status=outcome["status"],
+                    record_id=outcome["record_id"],
+                    policy_version=outcome["policy_version"],
+                )
+                counts[outcome["status"]] += 1
+            results.append(entry)
+
+        summary = {
+            "batch_size": len(items),
+            "created": counts["created"],
+            "duplicate": counts["duplicate"],
+            "rejected": counts["rejected"],
+        }
+        self._audit(
+            tenant_id=tenant_id,
+            event_type="batch_write",
+            decision="allow",
+            reason="batch_ingest_complete",
+            policy_version=policy.version,
+            subject=None,
+            record_id=None,
+            input_summary=summary,
+            evidence={"rejected_reasons": sorted(
+                {r.get("reason") for r in results if r["status"] == "rejected"}
+            )},
+        )
+        return {
+            "tenant_id": tenant_id,
+            "policy_version": policy.version,
+            "results": results,
+            **summary,
         }
 
     @staticmethod

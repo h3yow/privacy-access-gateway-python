@@ -13,6 +13,7 @@ from app.errors import (
     RetentionError,
 )
 from app.schemas import (
+    BatchWriteIn,
     PolicyChangeIn,
     ProvisionIn,
     SubjectIn,
@@ -87,6 +88,14 @@ def register_routes() -> APIRouter:
     @router.post("/records")
     def write_record(tenant_id: str, body: WriteIn, svc: GatewayService = Depends(get_service)):
         return svc.write_record(tenant_id, body.payload, body.attributes)
+
+    @router.post("/records/batch")
+    def write_records_batch(
+        tenant_id: str, body: BatchWriteIn, svc: GatewayService = Depends(get_service)
+    ):
+        # The batch call itself returns 200 for any processable envelope;
+        # per-item created/duplicate/rejected outcomes are in body.results.
+        return svc.write_records_batch(tenant_id, body.records)
 
     @router.get("/records/{record_id}")
     def read_record(
